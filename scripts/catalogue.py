@@ -80,20 +80,26 @@ def report(message):
 class GitHub:
     def __init__(self):
         repository = os.environ.get("GITHUB_REPOSITORY", "")
+    def __init__(self, repository=None, token=None, api_url=None, api_version="2022-11-28"):
+        repository = repository if repository is not None else os.environ.get("GITHUB_REPOSITORY", "")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
             fail("GITHUB_REPOSITORY must be owner/repository.")
         self.repository = repository
         self.base = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+        self.base = (api_url or os.environ.get("GITHUB_API_URL", "https://api.github.com")).rstrip("/")
         origin = urllib.parse.urlsplit(self.base)
         if origin.scheme != "https" and not (
             origin.scheme == "http" and origin.hostname in ("localhost", "127.0.0.1")
         ):
             fail("The GitHub API must use HTTPS.")
         self.token = os.environ.get("GITHUB_TOKEN", "")
+        self.token = token if token is not None else os.environ.get("GITHUB_TOKEN", "")
+        self.api_version = api_version
         self.root = f"/repos/{repository}"
         self.cache = {}
 
     def request(self, method, path, data=None, content_type="application/json", binary=False):
+    def request(self, method, path, data=None, content_type="application/json", binary=False, content_length=None):
         url = path if path.startswith(("https://", "http://")) else self.base + path
         target = urllib.parse.urlsplit(url)
         api = urllib.parse.urlsplit(self.base)
@@ -104,15 +110,21 @@ class GitHub:
             "Accept": "application/octet-stream" if binary else "application/vnd.github+json",
             "User-Agent": "Left2Mine-Maps-Publisher",
             "X-GitHub-Api-Version": "2022-11-28",
+            "X-GitHub-Api-Version": self.api_version,
             "Content-Type": content_type,
         })
+        if content_length is not None:
+            request.add_header("Content-Length", str(content_length))
         # Asset downloads redirect to storage. Never forward our token to that host.
         if self.token:
             request.add_unredirected_header("Authorization", f"Bearer {self.token}")
         try:
             return urllib.request.urlopen(request, timeout=120)
         except urllib.error.HTTPError as error:
+            code = error.code
+            error.close()
             raise RuntimeError(f"GitHub returned HTTP {error.code} for {method} {target.path}.") from None
+            raise RuntimeError(f"GitHub returned HTTP {code} for {method} {target.path}.") from None
 
     def json(self, method, path, data=None):
         body = None if data is None else json.dumps(data).encode("utf-8")
@@ -253,6 +265,7 @@ def world_icon(path, world_path):
     with zipfile.ZipFile(path) as archive:
         try:
             entry = archive.getinfo(world_path + "icon.png")
+            entry = archive.getinfo((world_path + "/" if world_path else "") + "icon.png")
         except KeyError:
             return None
         if entry.is_dir() or entry.file_size > MAX_IMAGE:
@@ -260,6 +273,29 @@ def world_icon(path, world_path):
         image = archive.read(entry)
         check_icon(image)
         return image
+
+
+def safe_world_path(name):
+    # Match the installer's MapRepository.safePath rules before uploading a map.
+    if (not name or len(name) > 1024 or name.startswith("/") or "\\" in name
+            or re.search(r'[\x00-\x1f<>:"|?*]', name)):
+        fail(f"Unsafe map path: {name!r}.")
+    for part in name.split("/"):
+        if (part in ("", ".", "..") or part.endswith((".", " "))
+                or re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part)):
+            fail(f"Unsafe map path: {name!r}.")
+
+
+def catalogue_world_path(path):
+    if not isinstance(path, str):
+        fail("The map metadata must specify its world folder.")
+    if path in ("", "."):
+        return ""
+    # Earlier publisher versions recorded a trailing slash. Rebuilds can repair
+    # their catalogue entries without modifying already published releases.
+    path = path.removesuffix("/")
+    safe_world_path(path)
+    return path
 
 
 def check_world(path):
@@ -271,18 +307,24 @@ def check_world(path):
         worlds = []
         for entry in entries:
             name = entry.filename
+            relative = name[:-1] if entry.is_dir() else name
+            safe_world_path(relative)
             parts = name.rstrip("/").split("/")
+            parts = relative.split("/")
             if (
                 not name or name.startswith("/") or "\\" in name or ":" in name
                 or any(part in ("", ".", "..") for part in parts)
+                name != entry.orig_filename
                 or stat.S_ISLNK(entry.external_attr >> 16) or entry.flag_bits & 1
             ):
                 fail(f"Unsafe or encrypted ZIP entry: {name!r}.")
             folded = name.rstrip("/").casefold()
+            folded = relative.casefold()
             if folded in names:
                 fail(f"Duplicate ZIP entry: {name!r}.")
             names.add(folded)
             if not entry.is_dir() and parts[-1] == "level.dat" and parts[0] != "__MACOSX":
+            if not entry.is_dir() and parts[-1] == "level.dat":
                 worlds.append(str(PurePosixPath(name).parent))
         if len(worlds) != 1:
             fail("The ZIP must contain exactly one Minecraft world (one level.dat file).")
@@ -290,6 +332,7 @@ def check_world(path):
         if corrupt:
             fail(f"The ZIP contains a damaged file: {corrupt}.")
         return "" if worlds[0] == "." else worlds[0] + "/"
+        return "" if worlds[0] == "." else worlds[0]
 
 
 def apply_inputs(metadata, inputs):
@@ -302,6 +345,7 @@ def apply_inputs(metadata, inputs):
 
 
 def publish(api, inputs, records, releases):
+def prepare_map(api, inputs, records, releases):
     tag, map_id, version = release_identity(inputs, records)
     release = next((r for r in releases if r["tag_name"] == tag), None)
     # Different names can reduce to the same tag. Never silently merge those maps.
@@ -337,12 +381,27 @@ def publish(api, inputs, records, releases):
     metadata.pop("archive", None)
     metadata.pop("icon", None)
     validate_fields(metadata)
+    return release, metadata
 
+
+def ensure_draft(api, release, metadata):
     if release is None:
         release = api.json("POST", f"{api.root}/releases", {
             "tag_name": tag, "name": f"{metadata['name']} {version}",
+            "tag_name": f"{metadata['id']}-v{metadata['version']}",
+            "name": f"{metadata['name']} {metadata['version']}",
             "draft": True, "prerelease": False, "make_latest": "false",
         })
+    return release
+
+
+def publish(api, inputs, records, releases):
+    release, metadata = prepare_map(api, inputs, records, releases)
+    if release and not release["draft"]:
+        report(f"Release `{release['tag_name']}` is already published; rebuilding the catalogue.")
+        return release, metadata
+    release = ensure_draft(api, release, metadata)
+    tag = release["tag_name"]
     zips = [a for a in release["assets"] if a["name"].lower().endswith(".zip")]
     if not zips:
         api.upload(release, MANIFEST, (json.dumps(metadata, indent=2) + "\n").encode(), "application/json")
@@ -413,6 +472,7 @@ def build_site(api, records, output):
             "file_size": archive["size"],
             "sha256": metadata["archive"]["sha256"],
             "world_path": metadata["archive"]["world_path"],
+            "world_path": catalogue_world_path(metadata["archive"]["world_path"]),
             **icon_fields,
             "release_url": release["html_url"],
             "published_at": release["published_at"],
