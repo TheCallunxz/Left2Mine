@@ -1,0 +1,72 @@
+name: Publish map
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "Map name, e.g. The Caves (leave all fields blank to rebuild only)"
+        type: string
+      author:
+        description: "Map author (required for a new map; blank keeps saved details)"
+        type: string
+      summary:
+        description: "Short map description (required for a new map; blank keeps saved details)"
+        type: string
+      version:
+        description: "Map version, e.g. 1.0.0 (the release tag is generated automatically)"
+        type: string
+      mode:
+        description: "Game mode (choose campaign or survival for a new map; keep reuses saved details)"
+        type: choice
+        default: keep
+        options:
+          - keep
+          - campaign
+          - survival
+
+permissions:
+  contents: read
+
+concurrency:
+  group: map-catalogue
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pages: read
+    steps:
+      - name: Check out publisher
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Check Pages setup
+        uses: actions/configure-pages@v5
+      - name: Prepare or publish map and build catalogue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MAP_INPUTS: ${{ toJSON(inputs) }}
+        run: python3 scripts/catalogue.py --output _site
+      - name: Upload catalogue
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+          retention-days: 1
+
+  deploy:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy catalogue
+        id: deployment
+        uses: actions/deploy-pages@v4
