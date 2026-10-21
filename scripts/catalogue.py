@@ -78,27 +78,22 @@ def report(message):
 
 
 class GitHub:
-    def __init__(self):
-        repository = os.environ.get("GITHUB_REPOSITORY", "")
     def __init__(self, repository=None, token=None, api_url=None, api_version="2022-11-28"):
         repository = repository if repository is not None else os.environ.get("GITHUB_REPOSITORY", "")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
             fail("GITHUB_REPOSITORY must be owner/repository.")
         self.repository = repository
-        self.base = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
         self.base = (api_url or os.environ.get("GITHUB_API_URL", "https://api.github.com")).rstrip("/")
         origin = urllib.parse.urlsplit(self.base)
         if origin.scheme != "https" and not (
             origin.scheme == "http" and origin.hostname in ("localhost", "127.0.0.1")
         ):
             fail("The GitHub API must use HTTPS.")
-        self.token = os.environ.get("GITHUB_TOKEN", "")
         self.token = token if token is not None else os.environ.get("GITHUB_TOKEN", "")
         self.api_version = api_version
         self.root = f"/repos/{repository}"
         self.cache = {}
 
-    def request(self, method, path, data=None, content_type="application/json", binary=False):
     def request(self, method, path, data=None, content_type="application/json", binary=False, content_length=None):
         url = path if path.startswith(("https://", "http://")) else self.base + path
         target = urllib.parse.urlsplit(url)
@@ -109,7 +104,6 @@ class GitHub:
         request = urllib.request.Request(url, data=data, method=method, headers={
             "Accept": "application/octet-stream" if binary else "application/vnd.github+json",
             "User-Agent": "Left2Mine-Maps-Publisher",
-            "X-GitHub-Api-Version": "2022-11-28",
             "X-GitHub-Api-Version": self.api_version,
             "Content-Type": content_type,
         })
@@ -123,7 +117,6 @@ class GitHub:
         except urllib.error.HTTPError as error:
             code = error.code
             error.close()
-            raise RuntimeError(f"GitHub returned HTTP {error.code} for {method} {target.path}.") from None
             raise RuntimeError(f"GitHub returned HTTP {code} for {method} {target.path}.") from None
 
     def json(self, method, path, data=None):
@@ -264,7 +257,6 @@ def check_icon(content):
 def world_icon(path, world_path):
     with zipfile.ZipFile(path) as archive:
         try:
-            entry = archive.getinfo(world_path + "icon.png")
             entry = archive.getinfo((world_path + "/" if world_path else "") + "icon.png")
         except KeyError:
             return None
@@ -309,21 +301,16 @@ def check_world(path):
             name = entry.filename
             relative = name[:-1] if entry.is_dir() else name
             safe_world_path(relative)
-            parts = name.rstrip("/").split("/")
             parts = relative.split("/")
             if (
-                not name or name.startswith("/") or "\\" in name or ":" in name
-                or any(part in ("", ".", "..") for part in parts)
                 name != entry.orig_filename
                 or stat.S_ISLNK(entry.external_attr >> 16) or entry.flag_bits & 1
             ):
                 fail(f"Unsafe or encrypted ZIP entry: {name!r}.")
-            folded = name.rstrip("/").casefold()
             folded = relative.casefold()
             if folded in names:
                 fail(f"Duplicate ZIP entry: {name!r}.")
             names.add(folded)
-            if not entry.is_dir() and parts[-1] == "level.dat" and parts[0] != "__MACOSX":
             if not entry.is_dir() and parts[-1] == "level.dat":
                 worlds.append(str(PurePosixPath(name).parent))
         if len(worlds) != 1:
@@ -331,7 +318,6 @@ def check_world(path):
         corrupt = archive.testzip()
         if corrupt:
             fail(f"The ZIP contains a damaged file: {corrupt}.")
-        return "" if worlds[0] == "." else worlds[0] + "/"
         return "" if worlds[0] == "." else worlds[0]
 
 
@@ -344,7 +330,6 @@ def apply_inputs(metadata, inputs):
     return result
 
 
-def publish(api, inputs, records, releases):
 def prepare_map(api, inputs, records, releases):
     tag, map_id, version = release_identity(inputs, records)
     release = next((r for r in releases if r["tag_name"] == tag), None)
@@ -364,7 +349,6 @@ def prepare_map(api, inputs, records, releases):
             fail("This release is already public but has no map metadata. Prepare a draft release instead.")
         if apply_inputs(existing, inputs) != existing:
             fail("Published details are fixed. Create a new version to change them.")
-        report(f"Release `{tag}` is already published; rebuilding the catalogue.")
         return release, existing
 
     earlier = sorted(
@@ -387,7 +371,6 @@ def prepare_map(api, inputs, records, releases):
 def ensure_draft(api, release, metadata):
     if release is None:
         release = api.json("POST", f"{api.root}/releases", {
-            "tag_name": tag, "name": f"{metadata['name']} {version}",
             "tag_name": f"{metadata['id']}-v{metadata['version']}",
             "name": f"{metadata['name']} {metadata['version']}",
             "draft": True, "prerelease": False, "make_latest": "false",
@@ -440,6 +423,17 @@ def publish(api, inputs, records, releases):
     return release, metadata
 
 
+def publication_time(value):
+    if isinstance(value, str):
+        try:
+            date = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if date.tzinfo is not None:
+                return date.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
+            pass
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
 def build_site(api, records, output):
     output.mkdir(parents=True, exist_ok=True)
     (output / "icons").mkdir(exist_ok=True)
@@ -471,16 +465,19 @@ def build_site(api, records, output):
             "download_url": download_url,
             "file_size": archive["size"],
             "sha256": metadata["archive"]["sha256"],
-            "world_path": metadata["archive"]["world_path"],
             "world_path": catalogue_world_path(metadata["archive"]["world_path"]),
             **icon_fields,
             "release_url": release["html_url"],
-            "published_at": release["published_at"],
+            "published_at": release.get("published_at"),
         })
+    maps = sorted(grouped.values(), key=lambda entry: (entry["name"].casefold(), entry["id"]))
+    # Stable sorting keeps tied or undated maps alphabetical. Rebuilds do not bump maps.
+    maps.sort(key=lambda entry: max(publication_time(version["published_at"])
+                                   for version in entry["versions"]), reverse=True)
     catalogue = {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "maps": sorted(grouped.values(), key=lambda entry: entry["name"].casefold()),
+        "maps": maps,
     }
     # Write the catalogue only after every record has passed validation.
     (output / "catalogue.json").write_text(json.dumps(catalogue, indent=2) + "\n", encoding="utf-8")
