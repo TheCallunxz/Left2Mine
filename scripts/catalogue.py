@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 
 
 MANIFEST = "left2mine-map.json"
@@ -27,7 +28,7 @@ TAG = re.compile(rf"([a-z0-9]+(?:-[a-z0-9]+)*)-v({VERSION})")
 MAX_ZIP = 2 * 1024**3 - 1
 MAX_IMAGE = 1024**2
 MAX_JSON = 128 * 1024
-TEXT_FIELDS = ("name", "author", "summary", "mode")
+TEXT_FIELDS = ("name", "author", "summary", "mode", "icon_mode")
 # Used for new maps. Existing releases keep their recorded compatibility.
 MINECRAFT_VERSION = "1.21.1"
 LEFT2MINE_MIN_VERSION = "2.0.0"
@@ -166,7 +167,8 @@ class GitHub:
     def upload(self, release, name, content, content_type):
         existing = next((a for a in release["assets"] if a["name"] == name), None)
         if existing:
-            if self.small_asset(existing, max(MAX_JSON, MAX_IMAGE)) == content:
+            unfinished = existing.get("state") == "starter" and existing.get("size") == 0
+            if not unfinished and self.small_asset(existing, max(MAX_JSON, MAX_IMAGE)) == content:
                 return existing
             with self.request("DELETE", f"{self.root}/releases/assets/{existing['id']}"):
                 pass
@@ -202,8 +204,10 @@ def validate_fields(metadata):
             fail(f"Provide {field.replace('_', ' ')} for a new map.")
         if len(value) > (2000 if field == "summary" else 160):
             fail(f"The {field} value is too long.")
-    if metadata["mode"] not in ("campaign", "survival"):
-        fail("Choose campaign or survival for a new map.")
+    if metadata.get("icon_mode", "auto") not in ("auto", "world", "left2mine"):
+        fail("Choose auto, world or left2mine for the map icon.")
+    if metadata["mode"] not in ("campaign", "survival", "both"):
+        fail("Choose campaign, survival or both for a new map.")
     if not re.fullmatch(VERSION, metadata["left2mine_min_version"]):
         fail("Use a Left 2 Mine minimum version such as 2.0.0.")
     versions = metadata.get("minecraft_versions")
@@ -244,27 +248,29 @@ def published_maps(api, releases):
 
 
 def check_icon(content):
-    if (
-        len(content) < 24 or content[:8] != b"\x89PNG\r\n\x1a\n"
-        or content[12:16] != b"IHDR"
-    ):
-        fail("The world's icon.png must be a PNG image.")
-    width, height = struct.unpack(">II", content[16:24])
-    if width != 64 or height != 64:
-        fail("The world's icon.png must be 64 by 64 pixels, as in Minecraft.")
-
-
-def world_icon(path, world_path):
-    with zipfile.ZipFile(path) as archive:
-        try:
-            entry = archive.getinfo((world_path + "/" if world_path else "") + "icon.png")
-        except KeyError:
-            return None
-        if entry.is_dir() or entry.file_size > MAX_IMAGE:
-            fail("The world's icon.png must be a file no larger than 1 MiB.")
-        image = archive.read(entry)
-        check_icon(image)
-        return image
+    # The local publisher decodes and chooses the image. The action only checks
+    # the uploaded PNG's dimensions, completeness and chunk checksums.
+    message = "Upload a complete 64 by 64 PNG as icon.png (at most 1 MiB), or retry with the local publisher."
+    if (not 45 <= len(content) <= MAX_IMAGE or content[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            or struct.unpack_from(">II", content, 16) != (64, 64)):
+        fail(message)
+    offset, has_pixels = 8, False
+    while offset + 12 <= len(content):
+        size = struct.unpack_from(">I", content, offset)[0]
+        end = offset + 8 + size
+        if end + 4 > len(content):
+            fail(message)
+        chunk = content[offset + 4:end]
+        if zlib.crc32(chunk) != struct.unpack_from(">I", content, end)[0]:
+            fail(message)
+        kind = chunk[:4]
+        has_pixels |= kind == b"IDAT" and size > 0
+        offset = end + 4
+        if kind == b"IEND":
+            if size == 0 and offset == len(content) and has_pixels:
+                return
+            break
+    fail(message)
 
 
 def safe_world_path(name):
@@ -290,7 +296,7 @@ def catalogue_world_path(path):
     return path
 
 
-def check_world(path):
+def check_world(path, *, verify_contents=True):
     with zipfile.ZipFile(path) as archive:
         entries = archive.infolist()
         if len(entries) > 100000 or sum(e.file_size for e in entries) > 8 * 1024**3:
@@ -315,7 +321,7 @@ def check_world(path):
                 worlds.append(str(PurePosixPath(name).parent))
         if len(worlds) != 1:
             fail("The ZIP must contain exactly one Minecraft world (one level.dat file).")
-        corrupt = archive.testzip()
+        corrupt = archive.testzip() if verify_contents else None
         if corrupt:
             fail(f"The ZIP contains a damaged file: {corrupt}.")
         return "" if worlds[0] == "." else worlds[0]
@@ -325,7 +331,9 @@ def apply_inputs(metadata, inputs):
     result = dict(metadata)
     for field in TEXT_FIELDS:
         value = inputs.get(field, "").strip()
-        if value and not (field == "mode" and value == "keep"):
+        if value and not (field in ("mode", "icon_mode") and value == "keep"):
+            if field == "icon_mode" and value == "auto" and field not in result:
+                continue
             result[field] = value
     return result
 
@@ -390,27 +398,30 @@ def publish(api, inputs, records, releases):
         api.upload(release, MANIFEST, (json.dumps(metadata, indent=2) + "\n").encode(), "application/json")
         report(
             f"Draft `{tag}` is ready. [Open the draft release]({release['html_url']}).\n\n"
-            "Edit it, attach one world ZIP, and choose **Save draft**. Then rerun this workflow "
+            "Edit it, attach one world ZIP and the finished **icon.png**, and choose **Save draft**. Then rerun this workflow "
             "with the same name and map version (or use **Re-run all jobs** on this run). "
             "The remaining details have been saved. This map is not published yet."
         )
         return None
     if len(zips) != 1:
         fail("Attach exactly one map ZIP to the draft release.")
+    image_asset = asset_named(release, "icon.png")
+    if image_asset is None:
+        fail("The draft needs a prepared icon.png. Retry Publish map in the local publisher, "
+             "or attach a 64 by 64 PNG named icon.png to the draft.")
+    image = api.small_asset(image_asset, MAX_IMAGE)
+    check_icon(image)
 
     with tempfile.TemporaryDirectory(prefix="left2mine-publish-") as directory:
         path = Path(directory) / "world.zip"
         with path.open("wb") as destination:
             digest = api.download(zips[0], destination, MAX_ZIP)
         world_path = check_world(path)
-        image = world_icon(path, world_path)
 
     # All input and archive checks finish before altering or publishing the draft.
-    if image is not None:
-        image_asset = api.upload(release, "icon.png", image, "image/png")
-        metadata["icon"] = {
-            "asset_id": image_asset["id"], "size": image_asset["size"], "sha256": sha256(image),
-        }
+    metadata["icon"] = {
+        "asset_id": image_asset["id"], "size": image_asset["size"], "sha256": sha256(image),
+    }
     metadata["archive"] = {
         "asset_id": zips[0]["id"], "size": zips[0]["size"],
         "sha256": digest, "world_path": world_path,
@@ -444,19 +455,27 @@ def build_site(api, records, output):
         icon_fields = {}
         if metadata.get("icon"):
             image_asset = checked_asset(release, metadata["icon"], ".png")
-            image = api.small_asset(image_asset, MAX_IMAGE)
-            digest = metadata["icon"]["sha256"]
-            if sha256(image) != digest:
-                fail(f"World icon checksum failed for {release['tag_name']}.")
-            check_icon(image)
-            image_path = f"icons/{digest}.png"
-            (output / image_path).write_bytes(image)
-            icon_fields = {"icon": image_path, "icon_sha256": digest}
+            if image_asset["size"] <= MAX_IMAGE:
+                content = api.small_asset(image_asset, MAX_IMAGE)
+                if sha256(content) != metadata["icon"]["sha256"]:
+                    fail(f"World icon checksum failed for {release['tag_name']}.")
+                try:
+                    check_icon(content)
+                except ValueError:
+                    report(f"Skipping invalid icon for `{release['tag_name']}`; the map remains available.")
+                else:
+                    digest = sha256(content)
+                    image_path = f"icons/{digest}.png"
+                    (output / image_path).write_bytes(content)
+                    icon_fields = {"icon": image_path, "icon_sha256": digest}
         download_url = archive["browser_download_url"]
         if not download_url.startswith(f"https://github.com/{api.repository}/releases/download/"):
             fail("A release has an unexpected public download URL.")
+        modes = ["campaign", "survival"] if metadata["mode"] == "both" else [metadata["mode"]]
         entry = grouped.setdefault(metadata["id"], {
-            field: metadata[field] for field in ("id", "name", "author", "summary", "mode")
+            **{field: metadata[field] for field in ("id", "name", "author", "summary")},
+            # Keep a single-mode fallback so older clients can still load this catalogue.
+            "mode": modes[0], "modes": modes,
         })
         entry.setdefault("versions", []).append({
             "version": metadata["version"],
@@ -496,7 +515,7 @@ def render_index(catalogue):
             f'<article>{image}'
             f'<h2>{escape(entry["name"])}</h2><p>By {escape(entry["author"])}</p>'
             f'<p>{escape(entry["summary"])}</p>'
-            f'<p>{escape(entry["mode"].title())} · Version {escape(version["version"])}</p>'
+            f'<p>{escape(" / ".join(mode.title() for mode in entry["modes"]))} · Version {escape(version["version"])}</p>'
             f'<p>Minecraft {escape(", ".join(version["minecraft_versions"]))} · '
             f'Left 2 Mine {escape(version["left2mine_min_version"])} or newer</p>'
             f'<a href="{escape(version["download_url"])}">Download map ZIP</a></article>'
@@ -528,11 +547,11 @@ def main():
         if not isinstance(inputs, dict) or any(not isinstance(v, str) for v in inputs.values()):
             fail("Workflow inputs must be strings.")
         if set(inputs) - set(TEXT_FIELDS) - {"version"}:
-            fail("Use only name, author, summary, version and mode in the publishing form.")
+            fail("Use only name, author, summary, version, mode and icon_mode in the publishing form.")
         api = GitHub()
         releases = api.releases()
         records = published_maps(api, releases)
-        if any(v.strip() and not (k == "mode" and v.strip() == "keep") for k, v in inputs.items()):
+        if any(v.strip() and not (k in ("mode", "icon_mode") and v.strip() == "keep") for k, v in inputs.items()):
             if result := publish(api, inputs, records, releases):
                 release, metadata = result
                 records = [(r, m) for r, m in records if r["id"] != release["id"]]

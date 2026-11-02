@@ -16,13 +16,23 @@ on:
         description: "Map version, e.g. 1.0.0 (the release tag is generated automatically)"
         type: string
       mode:
-        description: "Game mode (choose campaign or survival for a new map; keep reuses saved details)"
+        description: "Game mode (campaign, survival or both; keep reuses saved details)"
         type: choice
         default: keep
         options:
           - keep
           - campaign
           - survival
+          - both
+      icon_mode:
+        description: "Icon choice saved by the local publisher; keep for manual uploads of icon.png"
+        type: choice
+        default: keep
+        options:
+          - keep
+          - auto
+          - world
+          - left2mine
 
 permissions:
   contents: read
@@ -43,6 +53,10 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Check Pages setup
         uses: actions/configure-pages@v5
       - name: Prepare or publish map and build catalogue
